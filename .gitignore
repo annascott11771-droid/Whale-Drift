@@ -1,0 +1,14 @@
+.godot/
+build/
+*.exe
+*.pck
+.DS_Store
+Thumbs.db
+
+# Art/audio assets are intentionally not part of this repository.
+godot/assets/*.png
+godot/assets/*.webp
+godot/assets/*.wav
+godot/assets/*.ogg
+godot/assets/*.otf
+godot/assets/*.ico
