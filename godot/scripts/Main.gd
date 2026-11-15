@@ -22,6 +22,13 @@ const SPEED_GAIN := 0.060
 const PLAYER_ACCEL := 2350.0
 const PLAYER_MAX_VY := 470.0
 const PLAYER_DRAG := 7.5
+# Health: 6 points = 3 hearts (2 points per heart). A clean hit costs 1 point
+# (half a heart); a stacked bubble halves that hit to 0.5 points.
+const MAX_HP := 6.0
+const HEART_POINTS := 2.0
+const HIT_DAMAGE := 1.0
+const MAX_BUBBLES := 6
+const BUBBLE_SOAK := 0.5
 const DASH_DURATION := 0.55
 const DASH_COOLDOWN := 5.0
 const HIT_INVULN := 1.7
@@ -69,6 +76,7 @@ const SENS_VALUES := [0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6]
 const VOL_VALUES := [0,10,20,30,40,50,60,70,80,90,100]
 const DISPLAY_MODES := ["windowed","borderless","fullscreen"]
 const SETTING_ROWS := ["difficulty","display_mode","resolution","fps_limit","sensitivity","volume","screen_shake","show_fps","language"]
+const SETTING_ROWS_MOBILE := ["difficulty","fps_limit","sensitivity","volume","screen_shake","show_fps","language"]
 
 var textures := {}
 var whale_frames: Array[Texture2D] = []
@@ -106,7 +114,9 @@ var pearls := 0
 var scroll_x := 0.0
 var speed := BASE_SPEED
 var biome_index := 0
-var hearts := 3
+var hp := MAX_HP
+var bubble_stacks := 0
+var bubble_timer := 0.0
 var player_y := 361.0
 var player_vy := 0.0
 var invuln := 0.0
@@ -116,7 +126,6 @@ var dash_held := false
 var pad_dash_held := false
 var pad_nav_dir := Vector2i.ZERO
 var pad_nav_timer := 0.0
-var shield := false
 var boost_timer := 0.0
 var shake := 0.0
 var flash := 0.0
@@ -136,12 +145,22 @@ var capture_path := ""
 var capture_frames := -1
 var capture_scene := ""
 var capture_resize := Vector2i.ZERO
+var capture_hp := -1.0
+var shop: Control
+var run_payout := 0
+var heart_tex: Texture2D
+var heart_masks := {}
 var capture_done := false
+var is_mobile := false
+var force_mobile := false
+var touch_dragging := false
 var fps_value := 0.0
+var fps_shown := 0.0
 var frame_count := 0
 var checkpoint_saved := 0.0
 var game_time := 0.0
 var tutorial_timer := 0.0
+var _sb_cache := {}
 
 func T(key: String) -> String:
 	var table: Dictionary = StringsEN.TEXT if settings.get("language", "en") == "en" else WhaleStrings.TEXT
@@ -167,12 +186,17 @@ func _diff_desc() -> String:
 # ---------------------------------------------------------------------------
 func _ready() -> void:
 	rng.randomize()
+	_setup_shop()
 	_load_assets()
 	_load_settings()
 	_load_save()
+	_parse_capture_args()
+	is_mobile = OS.has_feature("mobile") or force_mobile
+	# Never synthesise mouse clicks from touches: on touch laptops/tablets that
+	# made every tap fire twice (menu -> wrong item, restart -> instant restart).
+	Input.set_emulate_mouse_from_touch(false)
 	_apply_audio()
 	_apply_window()
-	_parse_capture_args()
 	if capture_resize != Vector2i.ZERO:
 		settings.resolution = capture_resize
 		_apply_window()
@@ -180,20 +204,72 @@ func _ready() -> void:
 		state = "settings"
 	elif capture_scene == "play":
 		_start_new()
+		if capture_hp >= 0.0:
+			hp = capture_hp
 	elif capture_scene == "pause":
 		_start_new()
 		state = "paused"
 	elif capture_scene == "gameover":
 		_start_new()
-		hearts = 0
+		hp = 0.0
 		state = "gameover"
 	elif capture_scene == "help":
 		state = "help"
+	elif capture_scene == "shop":
+		_open_shop()
 	elif capture_scene == "hazards":
 		_start_new()
 		state = "playing"
 		_spawn_gate(PLAYER_X + 300.0)
 	queue_redraw()
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_GO_BACK_REQUEST:
+		# Android hardware/gesture back button.
+		if state == "playing":
+			state = "paused"; selection = 0; touch_dragging = false
+		elif state in ["settings", "help", "paused", "gameover"]:
+			state = "menu"; selection = 0
+		else:
+			get_tree().quit()
+	elif what == NOTIFICATION_APPLICATION_PAUSED or what == NOTIFICATION_WM_WINDOW_FOCUS_OUT:
+		# Switching apps must not kill the run.
+		if is_mobile and state == "playing":
+			state = "paused"; selection = 0; touch_dragging = false
+
+func _setup_shop() -> void:
+	var scene := load("res://ShopUI.tscn")
+	if scene == null:
+		return
+	shop = scene.instantiate()
+	add_child(shop)
+	shop.setup(font_regular, font_bold, Callable(self, "T"))
+	shop.closed.connect(_on_shop_closed)
+	shop.purchased.connect(_on_shop_purchased)
+	shop.denied.connect(_on_shop_denied)
+	shop.visible = false
+
+func _open_shop() -> void:
+	if shop == null:
+		return
+	state = "shop"
+	selection = 2
+	shop.open()
+	_play_sfx("sfx_ui", 0.5)
+	queue_redraw()
+
+func _on_shop_closed() -> void:
+	state = "menu"
+	selection = 2
+	_play_sfx("sfx_ui", 0.4)
+	queue_redraw()
+
+func _on_shop_purchased(kind: String, level: int) -> void:
+	_play_sfx("sfx_power", 0.8)
+	queue_redraw()
+
+func _on_shop_denied(kind: String) -> void:
+	_play_sfx("sfx_hit", 0.45)
 
 func _make_glow(px: int, col: Color) -> ImageTexture:
 	# 生成径向渐变光晕纹理（中心亮、边缘透明）
@@ -348,10 +424,16 @@ func _play_sfx(name: String, volume := 0.8) -> void:
 # ---------------------------------------------------------------------------
 func _apply_window() -> void:
 	if DisplayServer.get_name() != "headless":
-		var fps := int(settings.fps_limit)
-		var vs := DisplayServer.VSYNC_DISABLED if (fps <= 0 or fps >= 120) else DisplayServer.VSYNC_ENABLED
-		DisplayServer.window_set_vsync_mode(vs)
-	if settings.display_mode == "fullscreen":
+		DisplayServer.window_set_vsync_mode(_vsync_mode())
+	if is_mobile:
+		# Physical screen size is owned by the OS; never resize the window here.
+		# (Screenshot tooling keeps a normal window so it can pick a size.)
+		if capture_resize == Vector2i.ZERO:
+			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
+		else:
+			DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
+			DisplayServer.window_set_size(capture_resize)
+	elif settings.display_mode == "fullscreen":
 		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_EXCLUSIVE_FULLSCREEN)
 	elif settings.display_mode == "borderless":
 		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN)
@@ -359,18 +441,35 @@ func _apply_window() -> void:
 		DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_WINDOWED)
 		DisplayServer.window_set_size(Vector2i(settings.resolution))
 		get_window().size = Vector2i(settings.resolution)
-		# Re-assert content scaling after a live resolution change so fonts and
-		# HUD geometry are recalculated instead of staying at the old scale.
-		var win := get_window()
-		win.content_scale_size = Vector2i(1280, 720)
-		win.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
-		win.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_KEEP
+	var win := get_window()
+	win.content_scale_size = Vector2i(1280, 720)
+	win.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
+	# EXPAND keeps the design canvas at least 1280x720 and reveals extra space
+	# instead of adding letterbox bars, which is what tablets/phones need.
+	win.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_EXPAND if is_mobile else Window.CONTENT_SCALE_ASPECT_KEEP
+	win.content_scale_factor = 1.0
+	_update_layout()
+	Engine.max_fps = int(settings.fps_limit)
+
+func _vsync_mode() -> int:
+	# Vsync is only switched off when an explicit cap sits below the panel
+	# refresh rate; otherwise it would pin the game to the refresh rate and the
+	# FPS counter would never match the selected limit.
+	var fps := int(settings.fps_limit)
+	if fps > 0:
+		var refresh := DisplayServer.screen_get_refresh_rate()
+		if refresh > 0.0 and float(fps) < refresh - 1.0:
+			return DisplayServer.VSYNC_DISABLED
+		return DisplayServer.VSYNC_ENABLED
+	return DisplayServer.VSYNC_ENABLED if is_mobile else DisplayServer.VSYNC_DISABLED
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
-		mouse_pos = get_viewport().get_mouse_position()
+		# Use the event position (screen space -> node local) instead of the OS
+		# cursor so clicks stay accurate on scaled windows and tablets.
+		mouse_pos = event.position - position
 	elif event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
-		mouse_pos = get_viewport().get_mouse_position()
+		mouse_pos = event.position - position
 		_handle_click()
 	elif event is InputEventKey and event.pressed and not event.echo:
 		var key: int = int(event.keycode)
@@ -379,6 +478,54 @@ func _unhandled_input(event: InputEvent) -> void:
 		_handle_key(key)
 	elif event is InputEventJoypadButton and event.pressed:
 		_handle_pad_button(event.button_index)
+	elif event is InputEventScreenTouch:
+		_handle_screen_touch(event)
+	elif event is InputEventScreenDrag:
+		if state == "playing" and touch_dragging:
+			player_y = clampf(player_y + event.relative.y, PLAYER_MIN_Y, PLAYER_MAX_Y)
+			player_vy = 0.0
+
+func _update_layout() -> void:
+	# With EXPAND the visible design area can be larger than 1280x720; keep the
+	# game canvas centred so nothing sits under a notch or off-centre.
+	if is_mobile:
+		var vis := get_viewport().get_visible_rect().size
+		position = ((vis - Vector2(W, H)) * 0.5).floor()
+	else:
+		position = Vector2.ZERO
+
+func _screen_rect() -> Rect2:
+	return Rect2(-position, get_viewport().get_visible_rect().size)
+
+func _view_local() -> Rect2:
+	return _screen_rect()
+
+func _mobile_pause_rect() -> Rect2:
+	var s := _screen_rect()
+	return Rect2(s.position.x + 20.0, s.end.y - 96.0, 64.0, 64.0)
+
+func _mobile_dash_rect() -> Rect2:
+	var s := _screen_rect()
+	return Rect2(s.end.x - 108.0, s.end.y - 108.0, 88.0, 88.0)
+
+func _handle_screen_touch(event: InputEventScreenTouch) -> void:
+	# Screen positions arrive in design space; the node itself may be offset.
+	var lp: Vector2 = event.position - position
+	if state == "playing":
+		if event.pressed:
+			if is_mobile and _mobile_pause_rect().has_point(lp):
+				state = "paused"; selection = 0; touch_dragging = false
+				_play_sfx("sfx_ui", 0.5)
+			elif is_mobile and _mobile_dash_rect().has_point(lp):
+				_dash()
+			else:
+				touch_dragging = true
+		else:
+			touch_dragging = false
+	elif state in ["menu", "settings", "help", "paused", "gameover"]:
+		if event.pressed:
+			mouse_pos = lp
+			_handle_click()
 
 func _pad_nav_vector() -> Vector2i:
 	var vx := 0
@@ -447,6 +594,14 @@ func _handle_pad_button(button: int) -> void:
 		else:
 			_handle_key(KEY_ENTER)
 
+func _setting_rows() -> Array:
+	# Display mode and resolution are OS-owned on mobile, so they are hidden
+	# there instead of showing controls that cannot do anything.
+	return SETTING_ROWS_MOBILE if is_mobile else SETTING_ROWS
+
+func _setting_row_rect(i: int) -> Rect2:
+	return Rect2(174, 148 + i * 42, 932, 38)
+
 func _handle_key(key: int) -> void:
 	if key == KEY_L:
 		settings.language = "zh" if str(settings.get("language", "en")) == "en" else "en"
@@ -468,12 +623,14 @@ func _handle_key(key: int) -> void:
 		return
 	if state == "settings":
 		if key in [KEY_ESCAPE, KEY_BACKSPACE]:
-			state = "menu"; selection = 1
+			state = "menu"; selection = 4
 		elif key in [KEY_UP, KEY_W]:
-			settings_selection = (settings_selection - 1 + SETTING_ROWS.size()) % SETTING_ROWS.size()
+			var row_count := _setting_rows().size()
+			settings_selection = (settings_selection - 1 + row_count) % row_count
 			_play_sfx("sfx_ui",0.5)
 		elif key in [KEY_DOWN, KEY_S]:
-			settings_selection = (settings_selection + 1) % SETTING_ROWS.size()
+			var row_count2 := _setting_rows().size()
+			settings_selection = (settings_selection + 1) % row_count2
 			_play_sfx("sfx_ui",0.5)
 		elif key in [KEY_LEFT, KEY_A]:
 			_cycle_setting(settings_selection, -1)
@@ -484,18 +641,22 @@ func _handle_key(key: int) -> void:
 		return
 	if state == "menu":
 		if key in [KEY_UP, KEY_W]:
-			selection = (selection - 1 + 5) % 5
+			selection = (selection - 1 + 6) % 6
 			_play_sfx("sfx_ui",0.4)
 		elif key in [KEY_DOWN, KEY_S]:
-			selection = (selection + 1) % 5
+			selection = (selection + 1) % 6
 			_play_sfx("sfx_ui",0.4)
 		elif key in [KEY_ENTER, KEY_KP_ENTER, KEY_SPACE]:
 			_menu_activate(selection)
 		elif key == KEY_ESCAPE:
 			get_tree().quit()
+	elif state == "shop":
+		if key in [KEY_ESCAPE, KEY_BACKSPACE]:
+			if shop != null:
+				shop.close()
 	elif state == "help":
 		if key in [KEY_ESCAPE, KEY_BACKSPACE, KEY_ENTER, KEY_KP_ENTER, KEY_SPACE]:
-			state = "menu"; selection = 2
+			state = "menu"; selection = 3
 	elif state == "playing":
 		if key in [KEY_ESCAPE, KEY_P]:
 			state = "paused"; selection = 0; _play_sfx("sfx_ui",0.5)
@@ -526,6 +687,10 @@ func _handle_key(key: int) -> void:
 	queue_redraw()
 
 func _handle_click() -> void:
+	# Only menus react to clicks; while diving there is no clickable UI, and the
+	# button list from the previous screen must never leak into gameplay.
+	if not (state in ["menu", "settings", "help", "paused", "gameover"]):
+		return
 	for b in ui_buttons:
 		if b.rect.has_point(mouse_pos):
 			var id = b.id
@@ -538,7 +703,7 @@ func _handle_click() -> void:
 			elif state == "settings":
 				if id is int:
 					if id == -1:
-						state = "menu"; selection = 1
+						state = "menu"; selection = 4
 					elif id == -2:
 						_reset_settings()
 					elif id >= 100:
@@ -546,26 +711,30 @@ func _handle_click() -> void:
 					else:
 						_cycle_setting(id, 1)
 			elif state == "help":
-				state = "menu"; selection = 2
+				state = "menu"; selection = 3
 			return
 	if state == "settings":
-		# clicking the rows selects them
-		for i in range(SETTING_ROWS.size()):
-			var r := Rect2(174, 148 + i * 42, 932, 38)
-			if r.has_point(mouse_pos):
+		# Tapping anywhere on a row selects it; tapping the right side also
+		# cycles the value, which makes touch settings usable with a fingertip.
+		var rows := _setting_rows()
+		for i in range(rows.size()):
+			if _setting_row_rect(i).has_point(mouse_pos):
 				settings_selection = i
+				if mouse_pos.x > 700.0:
+					_cycle_setting(i, 1)
 				return
 	if state == "help":
-		state = "menu"; selection = 2
+		state = "menu"; selection = 3
 
 func _menu_activate(id: int) -> void:
 	_play_sfx("sfx_ui")
 	match id:
 		0: _start_new()
 		1: _continue_run()
-		2: state = "help"; selection = 0
-		3: state = "settings"; settings_selection = 0
-		4: get_tree().quit()
+		2: _open_shop()
+		3: state = "help"; selection = 0
+		4: state = "settings"; settings_selection = 0
+		5: get_tree().quit()
 
 func _pause_activate() -> void:
 	if selection == 0:
@@ -628,7 +797,9 @@ func _desc(key: String) -> String:
 	return ""
 
 func _cycle_setting(index: int, delta: int) -> void:
-	var key: String = SETTING_ROWS[index]
+	var rows := _setting_rows()
+	index = clampi(index, 0, rows.size() - 1)
+	var key: String = rows[index]
 	var step := 1 if delta >= 0 else -1
 	match key:
 		"difficulty":
@@ -668,11 +839,14 @@ func _reset_settings() -> void:
 # ---------------------------------------------------------------------------
 func _start_new() -> void:
 	state = "playing"
+	ui_buttons.clear()
+	touch_dragging = false
+	speed = BASE_SPEED * float(_difficulty().speed_mult)
 	scroll_x = 0.0
 	distance = 0.0
 	score = 0
 	pearls = 0
-	hearts = 3
+	hp = MAX_HP
 	player_y = (PLAY_TOP + PLAY_BOTTOM) / 2.0
 	player_vy = 0.0
 	invuln = 1.2
@@ -682,7 +856,9 @@ func _start_new() -> void:
 	pad_dash_held = false
 	pad_nav_dir = Vector2i.ZERO
 	pad_nav_timer = 0.0
-	shield = false
+	bubble_stacks = 0
+	bubble_timer = 0.0
+	run_payout = 0
 	boost_timer = 0.0
 	shake = 0.0
 	flash = 0.0
@@ -708,11 +884,14 @@ func _continue_run() -> void:
 	distance = maxf(0.0, float(cp.get("distance",0)))
 	scroll_x = distance * PX_PER_METER
 	pearls = maxi(0, int(cp.get("pearls",0)))
-	hearts = maxi(1, int(cp.get("hearts",3)))
+	hp = clampf(float(cp.get("hp", float(cp.get("hearts", 3)) * HEART_POINTS)), 1.0, MAX_HP)
+	bubble_stacks = clampi(int(cp.get("bubbles", 0)), 0, MAX_BUBBLES)
 	var yn := clampf(float(cp.get("yNorm",0.5)),0.0,1.0)
 	player_y = lerpf(PLAY_TOP + 60, PLAY_BOTTOM - 60, yn)
 	next_spawn = scroll_x + SPAWN_AHEAD + 580
 	next_pickup = scroll_x + SPAWN_AHEAD + 240
+	speed = minf(BASE_SPEED * float(_difficulty().speed_mult) + distance * SPEED_GAIN * float(_difficulty().ramp_mult),
+		MAX_SPEED * float(_difficulty().max_speed_mult))
 	invuln = 1.4
 	biome_index = int(distance / BIOME_LENGTH) % BIOMES.size()
 	biome_name = _biome_name(biome_index); biome_sub = _biome_sub(biome_index); biome_banner = 0.0
@@ -720,11 +899,11 @@ func _continue_run() -> void:
 	toast_timer = 3.2; toast_color = UI_ACCENT
 
 func _save_checkpoint(reason: String) -> void:
-	if state != "playing" or hearts <= 0:
+	if state != "playing" or hp <= 0.0:
 		return
 	save_data["checkpoint"] = {
 		"distance": distance, "yNorm": clampf((player_y - PLAY_TOP) / (PLAY_BOTTOM - PLAY_TOP),0,1),
-		"score": score, "pearls": pearls, "hearts": hearts, "biome": biome_index,
+		"score": score, "pearls": pearls, "hp": hp, "bubbles": bubble_stacks, "biome": biome_index,
 		"difficulty": settings.difficulty,
 	}
 	_save_save()
@@ -735,6 +914,8 @@ func _save_checkpoint(reason: String) -> void:
 func _die() -> void:
 	if state != "playing" and state != "dying": return
 	state = "gameover"; selection = 0
+	# 单局结算：按深度 / 收集 / 积分换珍珠，写入天赋存档
+	run_payout = GlobalData.add_run_pearls(distance, pearls, score)
 	save_data["runs"] = int(save_data.get("runs",0)) + 1
 	save_data["totalPearls"] = int(save_data.get("totalPearls",0)) + pearls
 	var best := float(save_data.get("bestDistance",0))
@@ -754,18 +935,34 @@ func _process(delta: float) -> void:
 	time += delta
 	game_time += delta
 	frame_count += 1
-	if fps_value <= 0: fps_value = 1.0/maxf(delta,0.0001)
-	else: fps_value = fps_value * 0.92 + (1.0/maxf(delta,0.0001)) * 0.08
-	if state == "playing" or state == "dying":
-		_tick_game(delta)
-	elif state == "menu" or state == "help" or state == "settings":
-		pass
+	var inst_fps := 1.0 / maxf(delta, 0.0001)
+	if fps_value <= 0.0:
+		fps_value = inst_fps
+	else:
+		fps_value = fps_value * 0.86 + inst_fps * 0.14
+	# Report the engine's own measurement (updated once a second) so the number
+	# on screen matches the real frame rate instead of a drifting average.
+	var measured := Engine.get_frames_per_second()
+	fps_shown = float(measured) if measured > 0 else fps_value
+	# Clamp and sub-step so a stutter cannot teleport the whale through a
+	# spike or skip a whole obstacle in one frame.
+	var dt := minf(delta, 0.10)
+	if state == "playing":
+		var steps := clampi(int(ceil(dt / 0.0166)), 1, 5)
+		var step_dt := dt / float(steps)
+		for _i in range(steps):
+			if state != "playing":
+				break
+			_tick_game(step_dt)
+	elif state == "dying":
+		_tick_game(dt)
 	_update_pad_nav(delta)
 	if toast_timer > 0: toast_timer = maxf(0.0, toast_timer - delta)
 	if biome_banner > 0: biome_banner = maxf(0.0, biome_banner - delta)
 	if capture_frames >= 0 and frame_count >= capture_frames and not capture_done:
 		capture_done = true
 		_capture_and_quit()
+	_update_layout()
 	queue_redraw()
 
 func _tick_game(delta: float) -> void:
@@ -808,6 +1005,11 @@ func _tick_game(delta: float) -> void:
 	if dash_timer > 0.0:
 		invuln = maxf(invuln, dash_timer + 0.2)
 	if dash_cd > 0: dash_cd = maxf(0.0, dash_cd-delta)
+	if bubble_stacks > 0:
+		# 气泡层会随时间消散，时长由天赋决定
+		bubble_timer = maxf(0.0, bubble_timer - delta)
+		if bubble_timer <= 0.0:
+			bubble_stacks = 0
 	if flash > 0: flash = maxf(0.0, flash-delta)
 	if boost_flash > 0: boost_flash = maxf(0.0, boost_flash-delta)
 	if shake > 0: shake = maxf(0.0, shake-delta*2.6)
@@ -820,10 +1022,29 @@ func _tick_game(delta: float) -> void:
 		_play_sfx("sfx_power",0.5)
 	_spawn_ahead()
 	_update_objects(delta)
+	_apply_magnet(delta)
 	_check_collisions()
-	if run_seconds - checkpoint_saved >= 5.0 and hearts > 0:
+	if run_seconds - checkpoint_saved >= 5.0 and hp > 0.0:
 		checkpoint_saved = run_seconds
 		_save_checkpoint("tick")
+
+func _apply_magnet(delta: float) -> void:
+	# 珍珠磁铁：天赋升级后，范围内的拾取物会被吸过来
+	var radius := GlobalData.get_magnet_radius()
+	if radius <= 0.0:
+		return
+	var pcx := _player_hit_cx()
+	var pcy := _player_hit_cy()
+	for pk in pickups:
+		if not pk.alive:
+			continue
+		var dx: float = (pk.x - scroll_x) - pcx
+		var dy: float = pk.y - pcy
+		var dist := sqrt(dx * dx + dy * dy)
+		if dist > 1.0 and dist < radius:
+			var pull := minf(720.0 * delta, dist)
+			pk["x"] -= (dx / dist) * pull
+			pk["base_y"] -= (dy / dist) * pull
 
 func _spawn_ahead() -> void:
 	while next_spawn < scroll_x + SPAWN_AHEAD:
@@ -950,9 +1171,25 @@ func _update_objects(delta: float) -> void:
 			o.rot += delta*120.0
 	for p in pickups: p["y"] = p.base_y + sin(game_time*2.2 + p.phase)*7.0
 	for d in decor: d["sway"] = sin(game_time*0.8 + d.phase)*2.0
-	obstacles = obstacles.filter(func(o): return o.x - scroll_x > -420)
-	pickups = pickups.filter(func(p): return p.alive and p.x - scroll_x > -160)
-	decor = decor.filter(func(d): return d.x - scroll_x > -220)
+	# In-place compaction: filter() allocated three arrays every frame.
+	var keep := 0
+	for o in obstacles:
+		if o.x - scroll_x > -420:
+			obstacles[keep] = o
+			keep += 1
+	obstacles.resize(keep)
+	keep = 0
+	for p in pickups:
+		if p.alive and p.x - scroll_x > -160:
+			pickups[keep] = p
+			keep += 1
+	pickups.resize(keep)
+	keep = 0
+	for d in decor:
+		if d.x - scroll_x > -220:
+			decor[keep] = d
+			keep += 1
+	decor.resize(keep)
 	for i in range(particles.size()-1, -1, -1):
 		var p = particles[i]
 		p.life -= delta
@@ -1071,20 +1308,33 @@ func _ellipse_hits_poly(center: Vector2, rx: float, ry: float, poly: PackedVecto
 			return true
 	return Geometry2D.is_point_in_polygon(center, poly)
 
+func _heart_fill(i: int) -> float:
+	# 1.0 = full heart, 0.5 = half, 0.0 = empty
+	return clampf((hp - float(i) * HEART_POINTS) / HEART_POINTS, 0.0, 1.0)
+
 func _hit_player() -> void:
-	if invuln > 0 or dash_timer > 0: return
-	if shield:
-		shield = false
-		invuln = 1.0
-		flash = 0.35
-		_play_sfx("sfx_hit",0.8)
+	if invuln > 0 or dash_timer > 0:
 		return
-	hearts -= 1
+	var dmg := HIT_DAMAGE
+	if bubble_stacks > 0:
+		# One bubble is spent and soaks half of this hit.
+		bubble_stacks = maxi(0, bubble_stacks - 1)
+		bubble_timer = GlobalData.get_shield_duration() if bubble_stacks > 0 else 0.0
+		dmg *= BUBBLE_SOAK
+		invuln = 0.85
+		flash = 0.3
+		shake = 0.5
+		_play_sfx("sfx_hit", 0.7)
+		hp = maxf(0.0, hp - dmg)
+		if hp <= 0.0:
+			_die()
+		return
+	hp = maxf(0.0, hp - dmg)
 	invuln = 1.7 * float(_difficulty().invuln_mult)
 	flash = 0.8
 	shake = 1.0
 	_play_sfx("sfx_hit",0.9)
-	if hearts <= 0:
+	if hp <= 0.0:
 		_die()
 
 func _collect(p: Dictionary) -> void:
@@ -1094,31 +1344,46 @@ func _collect(p: Dictionary) -> void:
 		_play_sfx("sfx_collect",0.45)
 		texts.append({"text":T("hud_pearl_pop"),"x":p.x-scroll_x,"y":p.y-20,"life":1.0,"max_life":1.0,"color":UI_GOLD,"size":20})
 	elif p.kind == "shield":
-		shield = true
 		_play_sfx("sfx_power",0.8)
-		toast = T("hud_shield_toast"); toast_sub = T("hud_shield_sub"); toast_timer = 2.0; toast_color = UI_ACCENT
+		if bubble_stacks >= MAX_BUBBLES:
+			toast = T("hud_bubble_full")
+			toast_sub = T("hud_bubble_max_sub")
+			toast_color = UI_MUTED
+		else:
+			bubble_stacks += 1
+			# 拾取即刷新护盾计时，时长由天赋等级决定（3.0 ~ 5.0 秒）
+			bubble_timer = GlobalData.get_shield_duration()
+			toast = "%s  ×%d" % [T("hud_bubble_stack"), bubble_stacks]
+			toast_sub = T("hud_bubble_sub")
+			toast_color = UI_ACCENT
+		toast_timer = 2.0
 	elif p.kind == "boost":
 		boost_timer = 5.0
 		boost_flash = 1.0
 		_play_sfx("sfx_power",0.8)
 		toast = T("hud_boost_toast"); toast_sub = T("hud_boost_sub"); toast_timer = 2.0; toast_color = UI_GOLD
 
+func _dash_time() -> float:
+	# 冲刺天赋：距离 100 为基准，每级 +20，冲刺时长按比例放大
+	return DASH_DURATION * GlobalData.get_dash_distance() / 100.0
+
 func _dash() -> void:
 	if state != "playing" or dash_cd > 0: return
-	dash_timer = DASH_DURATION
+	var dash_len := _dash_time()
+	dash_timer = dash_len
 	dash_cd = DASH_COOLDOWN * float(_difficulty().dash_cd_mult)
-	invuln = maxf(invuln, DASH_DURATION + 0.2)
+	invuln = maxf(invuln, dash_len + 0.2)
 	_play_sfx("sfx_dash",0.8)
 
 # ---------------------------------------------------------------------------
 # draw
 # ---------------------------------------------------------------------------
 func _draw() -> void:
-	if state == "menu" or state == "help" or state == "settings":
+	if state == "menu" or state == "help" or state == "settings" or state == "shop":
 		_draw_menu_background()
 		if state == "menu": _draw_menu()
 		elif state == "settings": _draw_settings()
-		else: _draw_help()
+		elif state == "help": _draw_help()
 		return
 	_draw_world()
 	_draw_ui()
@@ -1132,21 +1397,26 @@ func _draw_world() -> void:
 	draw_set_transform(shake_off)
 	var b: Dictionary = BIOMES[biome_index]
 	var tint: Color = b.tint
+	var view := _view_local()
 	if textures.has("ocean_bg"):
-		draw_texture_rect(textures.ocean_bg, Rect2(0,0,W,H), false, Color(tint.r, tint.g, tint.b, 1.0))
+		draw_texture_rect(textures.ocean_bg, view, false, Color(tint.r, tint.g, tint.b, 1.0))
 	# far ridge
 	var far: Texture2D = textures.get("layer_far")
 	if far:
 		var fs := far.get_size()
 		var fx := fmod(-scroll_x*0.085, fs.x)
-		draw_texture_rect(far, Rect2(fx, 80, fs.x, H-80), false, Color(tint.r,tint.g,tint.b,0.55))
-		draw_texture_rect(far, Rect2(fx+fs.x, 80, fs.x, H-80), false, Color(tint.r,tint.g,tint.b,0.55))
+		var fy := view.position.y + 80.0
+		var fh := maxf(120.0, view.end.y - fy)
+		draw_texture_rect(far, Rect2(fx, fy, fs.x, fh), false, Color(tint.r,tint.g,tint.b,0.55))
+		draw_texture_rect(far, Rect2(fx+fs.x, fy, fs.x, fh), false, Color(tint.r,tint.g,tint.b,0.55))
 	var mid: Texture2D = textures.get("layer_mid")
 	if mid:
 		var ms := mid.get_size()
 		var mx := fmod(-scroll_x*0.24, ms.x)
-		draw_texture_rect(mid, Rect2(mx, 130, ms.x, H-130), false, Color(tint.r,tint.g,tint.b,0.7))
-		draw_texture_rect(mid, Rect2(mx+ms.x, 130, ms.x, H-130), false, Color(tint.r,tint.g,tint.b,0.7))
+		var my := view.position.y + 130.0
+		var mh := maxf(120.0, view.end.y - my)
+		draw_texture_rect(mid, Rect2(mx, my, ms.x, mh), false, Color(tint.r,tint.g,tint.b,0.7))
+		draw_texture_rect(mid, Rect2(mx+ms.x, my, ms.x, mh), false, Color(tint.r,tint.g,tint.b,0.7))
 	# canyon walls
 	if textures.has("canyon_top") and textures.has("canyon_bottom"):
 		var top_tex: Texture2D = textures.canyon_top
@@ -1197,9 +1467,9 @@ func _draw_world() -> void:
 		else:
 			draw_circle(Vector2(p.x,p.y), maxf(1,p.size), Color(p.color.r,p.color.g,p.color.b,a*0.5))
 	if textures.has("vignette"):
-		draw_texture_rect(textures.vignette, Rect2(0,0,W,H), false)
-	if boost_flash > 0: draw_rect(Rect2(0,0,W,H), Color(1,0.85,0.55,0.18*boost_flash))
-	if flash > 0: draw_rect(Rect2(0,0,W,H), Color(1,0.3,0.35,0.28*flash))
+		draw_texture_rect(textures.vignette, view, false)
+	if boost_flash > 0: draw_rect(view, Color(1,0.85,0.55,0.18*boost_flash))
+	if flash > 0: draw_rect(view, Color(1,0.3,0.35,0.28*flash))
 	draw_set_transform(Vector2.ZERO)
 
 func _draw_obstacle(o: Dictionary, sx: float) -> void:
@@ -1238,9 +1508,26 @@ func _draw_player(off: Vector2) -> void:
 	var ang := clampf(-player_vy*0.030,-12,12) + sin(game_time*1.7)*1.2
 	var center := Vector2(PLAYER_X, player_y + sin(game_time*2.1)*3.0) + off
 	draw_circle(center, 80.0 * WHALE_SCALE, Color(0.55,0.9,0.85,0.06))
-	if shield:
-		var r := 98 + int(6*sin(game_time*4))
-		draw_texture_rect(textures.power_shield, Rect2(center-Vector2(r,r),Vector2(r*2,r*2)), false, Color(1,1,1,0.65))
+	if bubble_stacks > 0:
+		# 气泡护罩：大圈 + 描边 + 每层一颗小气泡，保证一定看得见
+		var life_frac := 1.0
+		if bubble_timer > 0.0:
+			life_frac = clampf(bubble_timer / maxf(0.01, GlobalData.get_shield_duration()), 0.25, 1.0)
+		var aura_r := (98.0 + float(bubble_stacks) * 4.0) * (1.0 + 0.025 * sin(game_time * 5.0))
+		draw_circle(center, aura_r, Color(0.55, 0.9, 1.0, 0.10))
+		draw_arc(center, aura_r, 0, TAU, 64, Color(0.72, 0.95, 1.0, 0.60 * life_frac), 2.5)
+		draw_arc(center, aura_r * 0.78, 0, TAU, 48, Color(0.72, 0.95, 1.0, 0.20 * life_frac), 1.0)
+		if textures.has("power_shield"):
+			var box := Vector2(aura_r, aura_r) * 2.1
+			draw_texture_rect(textures.power_shield, Rect2(center - box * 0.5, box), false,
+				Color(0.85, 0.98, 1.0, 0.55 * life_frac))
+		for i in range(bubble_stacks):
+			var a := TAU * float(i) / float(maxi(1, bubble_stacks)) + game_time * 1.1
+			var r := aura_r * 0.92 + 4.0 * sin(game_time * 4.0 + float(i))
+			var bc := center + Vector2(cos(a), sin(a) * 0.72) * r
+			var bs := 34.0
+			draw_circle(bc, bs * 0.5, Color(0.75, 0.96, 1.0, 0.16))
+			draw_arc(bc, bs * 0.5, 0, TAU, 24, Color(0.85, 0.99, 1.0, 0.7), 2.0)
 	# 无敌时鲸鱼本体隔帧闪烁（保留光环与护盾）
 	if invuln > 0 and dash_timer <= 0.0 and int(invuln*18) % 2 == 0:
 		return
@@ -1249,6 +1536,22 @@ func _draw_player(off: Vector2) -> void:
 	var ts := tex.get_size()
 	draw_texture_rect(tex, Rect2(-ts.x/2,-ts.y/2,ts.x,ts.y), false, Color(1,1,1,1) if dash_timer<=0 else Color(1.25,1.15,1.05,1))
 	draw_set_transform(Vector2.ZERO)
+
+func _draw_mobile_controls() -> void:
+	var pr := _mobile_pause_rect()
+	_draw_rounded(pr, Color8(3, 22, 36, 190), 18, Color8(126, 247, 218, 120), 1)
+	var bar_w := 6.0
+	draw_rect(Rect2(pr.position.x + 20, pr.position.y + 18, bar_w, 28), UI_ACCENT)
+	draw_rect(Rect2(pr.position.x + 34, pr.position.y + 18, bar_w, 28), UI_ACCENT)
+	var dr := _mobile_dash_rect()
+	var ready := dash_cd <= 0.0
+	var center := dr.get_center()
+	var rad := dr.size.x * 0.5
+	draw_circle(center, rad, Color8(3, 22, 36, 195))
+	draw_arc(center, rad - 1.0, 0, TAU, 48, Color8(126,247,218,110), 1.5)
+	var frac := 1.0 if ready else clampf(1.0 - dash_cd / maxf(0.01, DASH_COOLDOWN * float(_difficulty().dash_cd_mult)), 0, 1)
+	draw_arc(center, rad - 4.0, -PI/2, -PI/2 + TAU * frac, 48, UI_ACCENT if ready else Color8(91,132,136), 5.0)
+	_text(T("hud_dash_ready") if ready else T("hud_dash_cool"), center.x, center.y - 11.0, 13, UI_ACCENT if ready else UI_MUTED, true, "center", true)
 
 func _draw_ui() -> void:
 	# HUD chips
@@ -1259,7 +1562,7 @@ func _draw_ui() -> void:
 	_text(T("hud_best") % best, 336, 74, 12, UI_MUTED, false, "right")
 	_text(T("hud_difficulty") % _diff_name(), 24, 105, 12, BIOMES[biome_index].accent, true)
 	if settings.show_fps:
-		_text("%.0f FPS" % fps_value, 354, 108, 11, UI_MUTED, false, "right")
+		_text("%.0f FPS" % fps_shown, 354, 108, 11, UI_MUTED, false, "right")
 	_draw_chip(Rect2(444,20,386,78), 232)
 	_text(T("hud_biome"), 464, 32, 12, Color8(118,180,175), true)
 	_text(_biome_name(biome_index), 464, 48, 21, BIOMES[biome_index].accent, true)
@@ -1276,36 +1579,48 @@ func _draw_ui() -> void:
 	draw_texture_rect(textures.pearl, Rect2(1100,56,25,25), false)
 	_text("%d" % pearls, 1132, 76, 23, Color8(255,231,246), true)
 	_text(T("hud_life"), 1110, 128, 11, Color8(126,170,168), false, "right")
+	var hw := 28.0
+	var hh := 26.0
 	for i in range(3):
-		var col := Color(1,1,1,1) if i < hearts else Color(1,1,1,0.2)
-		draw_texture_rect(textures.icon_heart, Rect2(1158+i*38,108,28,26), false, col)
+		var hr := Rect2(1158 + i * 38, 108, hw, hh)
+		draw_texture_rect(heart_tex, hr, false, Color(1, 1, 1, 0.16))
+		# 血量按 0.5 点（四分之一颗心）为单位，四段贴图保证显示完全同步
+		var quarter := int(round(_heart_fill(i) * 4.0))
+		if quarter >= 4:
+			draw_texture_rect(heart_tex, hr, false)
+		elif quarter >= 1 and heart_masks.has(quarter):
+			draw_texture_rect(heart_masks[quarter], hr, false)
 	var sy := 148
-	if shield:
+	if bubble_stacks > 0:
 		draw_texture_rect(textures.power_shield, Rect2(1158,sy,38,38), false)
-		_text(T("hud_shield"), 1200, sy+19, 12, UI_ACCENT, true)
+		_text("%s ×%d" % [T("hud_bubble"), bubble_stacks], 1202, sy+19, 12, UI_ACCENT, true)
 		sy += 42
 	if boost_timer > 0:
 		draw_texture_rect(textures.power_boost, Rect2(1158,sy,36,36), false)
 		_text(T("hud_boost") % boost_timer, 1200, sy+18, 12, UI_GOLD, true)
-	# dash
-	_draw_chip(Rect2(24,652,258,42), 200)
-	draw_texture_rect(textures.icon_dash, Rect2(38,660,24,24), false)
-	var ready := dash_cd <= 0
-	draw_rect(Rect2(76,672,120,7), Color8(9,33,44))
-	var p := 1.0 if ready else 1.0-dash_cd/(DASH_COOLDOWN*float(_difficulty().dash_cd_mult))
-	draw_rect(Rect2(76,672,120*clampf(p,0,1),7), UI_ACCENT if ready else Color8(63,115,116))
-	_text(T("hud_dash_ready") if ready else T("hud_dash_cool"), 76, 666, 12, UI_ACCENT if ready else Color8(123,160,160), true)
-	_text("SHIFT / A", 268, 674, 10, Color8(94,137,140), false, "right")
-	# compact save status, bottom-right
-	var sr := Rect2(W-202, H-58, 178, 30)
-	_draw_chip(sr, 210)
-	draw_texture_rect(textures.icon_save, Rect2(sr.position.x+12, sr.position.y+7, 15, 15), false, Color(1,1,1,0.85))
-	draw_circle(Vector2(sr.position.x+37, sr.position.y+15), 3.5, UI_GREEN)
-	_text(T("hud_save_short"), sr.position.x+48, sr.position.y+7, 12, UI_GREEN, true)
+	if is_mobile:
+		# Touch build: the on-screen DASH button replaces the keyboard chip.
+		_draw_mobile_controls()
+	else:
+		# dash
+		_draw_chip(Rect2(24,652,258,42), 200)
+		draw_texture_rect(textures.icon_dash, Rect2(38,660,24,24), false)
+		var ready := dash_cd <= 0
+		draw_rect(Rect2(76,672,120,7), Color8(9,33,44))
+		var p := 1.0 if ready else 1.0-dash_cd/(DASH_COOLDOWN*float(_difficulty().dash_cd_mult))
+		draw_rect(Rect2(76,672,120*clampf(p,0,1),7), UI_ACCENT if ready else Color8(63,115,116))
+		_text(T("hud_dash_ready") if ready else T("hud_dash_cool"), 76, 666, 12, UI_ACCENT if ready else Color8(123,160,160), true)
+		_text("SHIFT / A", 268, 674, 10, Color8(94,137,140), false, "right")
+		# compact save status, bottom-right
+		var sr := Rect2(W-202, H-58, 178, 30)
+		_draw_chip(sr, 210)
+		draw_texture_rect(textures.icon_save, Rect2(sr.position.x+12, sr.position.y+7, 15, 15), false, Color(1,1,1,0.85))
+		draw_circle(Vector2(sr.position.x+37, sr.position.y+15), 3.5, UI_GREEN)
+		_text(T("hud_save_short"), sr.position.x+48, sr.position.y+7, 12, UI_GREEN, true)
 	if run_seconds < 9.5:
 		var a := int(210*clampf(minf(run_seconds/1.0,(9.5-run_seconds)/1.4),0,1))
 		_draw_rounded(Rect2(W/2-280,604,560,40), Color8(3,20,33,int(150*a/255)), 20)
-		_text(T("hud_hint"), W/2, 626, 15, Color8(211,242,232,a), true, "center")
+		_text(T("hud_mobile") if is_mobile else T("hud_hint"), W/2, 626, 15, Color8(211,242,232,a), true, "center")
 	if toast_timer > 0 and state in ["playing", "dying"]:
 		var a := int(255*clampf(minf((4.0-toast_timer)/0.25,toast_timer/0.55),0,1))
 		_draw_rounded(Rect2(W/2-210,108,420,44), Color8(3,20,33,int(200*a/255)), 20)
@@ -1319,22 +1634,39 @@ func _draw_ui() -> void:
 		_text(t.text, t.x, t.y, t.size, Color(t.color.r,t.color.g,t.color.b,a3), false, "center")
 
 func _draw_menu_background() -> void:
-	var tint := Color(0.55,0.9,0.9,1)
+	var view := _view_local()
 	if textures.has("ocean_bg"):
-		draw_texture_rect(textures.ocean_bg, Rect2(0,0,W,H), false, Color(0.75,0.9,0.95,1))
+		draw_texture_rect(textures.ocean_bg, view, false, Color(0.75,0.9,0.95,1))
 	if textures.has("layer_far"):
 		var fs: Vector2 = textures.layer_far.get_size()
 		var fx := fmod(-time*12.0, fs.x)
-		draw_texture_rect(textures.layer_far, Rect2(fx,80,fs.x,H-80), false, Color(0.8,1,1,0.4))
-		draw_texture_rect(textures.layer_far, Rect2(fx+fs.x,80,fs.x,H-80), false, Color(0.8,1,1,0.4))
+		var fy := view.position.y + 80.0
+		var fh := maxf(120.0, view.end.y - fy)
+		draw_texture_rect(textures.layer_far, Rect2(fx,fy,fs.x,fh), false, Color(0.8,1,1,0.4))
+		draw_texture_rect(textures.layer_far, Rect2(fx+fs.x,fy,fs.x,fh), false, Color(0.8,1,1,0.4))
 	if textures.has("vignette"):
-		draw_texture_rect(textures.vignette, Rect2(0,0,W,H), false)
+		draw_texture_rect(textures.vignette, view, false)
 	# whale
 	var whale: Texture2D = whale_frames[0] if whale_frames.size() > 0 else null
 	if whale != null:
 		var bob := sin(time*1.25)*9
 		draw_texture_rect(whale, Rect2(770,260+bob,334,195), false, Color(1,1,1,0.95))
 	# soft left shade (single gradient texture, no banding)
+	# 半心 / 四分之一心贴图：把右半部分的透明度清零，血量与显示才不会错位
+	heart_tex = textures.get("icon_heart")
+	if heart_tex != null:
+		for step in range(1, 4):
+			var hi := heart_tex.get_image()
+			hi.convert(Image.FORMAT_RGBA8)
+			var iw := hi.get_width()
+			var ih := hi.get_height()
+			var cut := int(float(iw) * float(step) / 4.0)
+			for yy in range(ih):
+				for xx in range(iw):
+					if xx >= cut:
+						var cc := hi.get_pixel(xx, yy)
+						hi.set_pixel(xx, yy, Color(cc.r, cc.g, cc.b, 0.0))
+			heart_masks[step] = ImageTexture.create_from_image(hi)
 	if textures.has("menu_shade"):
 		draw_texture_rect(textures.menu_shade, Rect2(0, 0, 760, H), false)
 
@@ -1348,10 +1680,11 @@ func _draw_menu() -> void:
 	var rows := [
 		[T("menu_new"), "%s · %s" % [_diff_name(),_diff_tag()], true],
 		[T("menu_continue"), _continue_label(), save_data.get("checkpoint") is Dictionary],
+		[T("menu_shop"), "%d" % GlobalData.total_pearls, true],
 		[T("menu_help"), "", true], [T("menu_settings"), "", true], [T("menu_quit"), "", true],
 	]
-	for i in range(5):
-		var r := Rect2(82,324+i*66,372,58)
+	for i in range(6):
+		var r := Rect2(82, 316 + i * 54, 372, 48)
 		_draw_button(r, rows[i][0], rows[i][1], selection == i, rows[i][2], i==0)
 		ui_buttons.append({"id":i,"rect":r})
 	_text(T("menu_best_depth"), 84, 656, 12, Color8(92,144,145))
@@ -1361,7 +1694,8 @@ func _draw_menu() -> void:
 	_text(T("menu_runs"), 426, 656, 12, Color8(92,144,145))
 	_text("%d" % int(save_data.get("runs",0)), 426, 680, 25, UI_TEXT, true)
 	_text(T("menu_hint"), W-34, 690, 13, Color8(134,177,176), false, "right")
-	_text(T("menu_version"), W-34, 704, 12, Color8(82,123,128), false, "right")
+	_text(T("menu_version_mobile") if is_mobile else T("menu_version"), W-34, 704, 12, Color8(82,123,128), false, "right")
+	_text(T("menu_pearls") % GlobalData.total_pearls, W-34, 74, 14, UI_GOLD, true, "right")
 	_draw_save_badge()
 
 func _continue_label() -> String:
@@ -1391,23 +1725,29 @@ func _draw_settings() -> void:
 	_text(T("set_kicker"), W/2, 68, 12, UI_ACCENT, true, "center")
 	_text(T("set_title"), W/2, 88, 34, UI_TEXT, true, "center")
 	ui_buttons.clear()
-	for i in range(SETTING_ROWS.size()):
-		var key: String = SETTING_ROWS[i]
-		var r := Rect2(174,148+i*42,932,38)
+	var rows := _setting_rows()
+	var row_count := rows.size()
+	settings_selection = clampi(settings_selection, 0, row_count - 1)
+	for i in range(row_count):
+		var key: String = rows[i]
+		var r := _setting_row_rect(i)
 		if i==settings_selection:
 			_draw_rounded(r, Color8(18,66,78,175), 10, Color8(126,247,218,155), 1)
 		var cy := r.position.y + r.size.y * 0.5
 		_text(_setting_label(key), 194, cy, 18, UI_TEXT, true, "left", true)
-		_text(_value_text(key), 760, cy, 18, BIOMES[0].accent, true, "right", true)
+		_text(_value_text(key), 750, cy, 18, BIOMES[0].accent, true, "right", true)
 		_text("<", 795, cy, 18, Color8(107,180,173), false, "center", true)
-		_text(">", 840, cy, 18, Color8(107,180,173), false, "center", true)
-		ui_buttons.append({"id":100+i,"rect":Rect2(785,r.position.y+8,28,28)})
-		ui_buttons.append({"id":i,"rect":Rect2(828,r.position.y+8,28,28)})
-	var desc := _desc(SETTING_ROWS[settings_selection])
-	_draw_rounded(Rect2(174,548,932,50), Color8(3,20,33,150), 10)
-	_text(desc, 194, 572, 13, UI_MUTED)
-	_draw_action(Rect2(410,604,220,46), T("set_done"), "DONE", false)
-	_draw_action(Rect2(660,604,220,46), T("set_reset"), "RESET", false)
+		_text(">", 850, cy, 18, Color8(107,180,173), false, "center", true)
+		# Generous hit areas so a fingertip can actually hit the arrows.
+		ui_buttons.append({"id":100+i,"rect":Rect2(774,r.position.y+2,44,34)})
+		ui_buttons.append({"id":i,"rect":Rect2(828,r.position.y+2,44,34)})
+	var desc := _desc(rows[settings_selection])
+	var desc_y := 148.0 + row_count * 42.0 + 12.0
+	_draw_rounded(Rect2(174,desc_y,932,50), Color8(3,20,33,150), 10)
+	_text(desc, 194, desc_y + 24.0, 13, UI_MUTED)
+	var btn_y := desc_y + 58.0
+	_draw_action(Rect2(410,btn_y,220,46), T("set_done"), "DONE", false)
+	_draw_action(Rect2(660,btn_y,220,46), T("set_reset"), "RESET", false)
 	_text(T("set_hint"), W/2, 684, 12, UI_MUTED, false, "center")
 
 func _setting_label(key: String) -> String:
@@ -1428,9 +1768,10 @@ func _draw_help() -> void:
 		T("help_l5"),
 		T("help_l6"),
 		T("help_l7"),
+		T("help_l8"),
 	]
 	for i in range(lines.size()):
-		_text(lines[i], 250, 210+i*54, 20, UI_TEXT if i<3 else UI_MUTED)
+		_text(lines[i], 250, 196+i*46, 19, UI_TEXT if i<3 else UI_MUTED)
 	_text(T("help_back"), W/2, 610, 14, UI_ACCENT, false, "center")
 	ui_buttons.clear()
 
@@ -1470,12 +1811,13 @@ func _draw_gameover() -> void:
 	_text("%d" % pearls, 640, 316, 27, UI_TEXT, true, "center")
 	_text(T("over_score"), 820, 284, 12, UI_MUTED, false, "center")
 	_text("%d" % score, 820, 316, 27, UI_TEXT, true, "center")
-	_text(T("over_best") % [float(save_data.get("bestDistance",0)), int(save_data.get("bestScore",0))], W/2, 366, 14, UI_MUTED, false, "center")
-	_text(T("over_difficulty") % [_diff_name(),_difficulty().score_mult], W/2, 396, 13, BIOMES[biome_index].accent, false, "center")
+	_text(T("over_best") % [float(save_data.get("bestDistance",0)), int(save_data.get("bestScore",0))], W/2, 358, 14, UI_MUTED, false, "center")
+	_text(T("over_difficulty") % [_diff_name(),_difficulty().score_mult], W/2, 382, 13, BIOMES[biome_index].accent, false, "center")
+	_text(T("over_earned") % [run_payout, GlobalData.total_pearls], W/2, 412, 16, UI_GOLD, true, "center")
 	ui_buttons.clear()
 	var labels := [[T("over_again"),"DIVE AGAIN"],[T("over_menu"),"MAIN MENU"]]
 	for i in range(2):
-		var r := Rect2(430,424+i*68,420,56)
+		var r := Rect2(430, 444 + i * 64, 420, 52)
 		_draw_button(r, labels[i][0], labels[i][1], selection==i, true, i==0)
 		ui_buttons.append({"id":i,"rect":r})
 	_text(T("over_hint"), W/2, 590, 13, Color8(113,158,159), false, "center")
@@ -1488,15 +1830,21 @@ func _draw_chip(r: Rect2, alpha: int) -> void:
 	draw_rect(r, Color8(96,205,188,55), false, 1.0)
 
 func _draw_rounded(r: Rect2, col: Color, radius: float, border_color: Color = Color(0,0,0,0), border_width: int = 0) -> void:
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = col
-	sb.corner_radius_top_left = int(radius)
-	sb.corner_radius_top_right = int(radius)
-	sb.corner_radius_bottom_left = int(radius)
-	sb.corner_radius_bottom_right = int(radius)
-	if border_width > 0:
-		sb.set_border_width_all(border_width)
-		sb.border_color = border_color
+	# Cached: allocating a StyleBoxFlat per call every frame caused visible
+	# micro-stutter on mobile.
+	var key := "%d_%d_%d_%d" % [int(radius), col.to_rgba32(), border_color.to_rgba32(), border_width]
+	var sb: StyleBoxFlat = _sb_cache.get(key)
+	if sb == null:
+		sb = StyleBoxFlat.new()
+		sb.bg_color = col
+		sb.corner_radius_top_left = int(radius)
+		sb.corner_radius_top_right = int(radius)
+		sb.corner_radius_bottom_left = int(radius)
+		sb.corner_radius_bottom_right = int(radius)
+		if border_width > 0:
+			sb.set_border_width_all(border_width)
+			sb.border_color = border_color
+		_sb_cache[key] = sb
 	draw_style_box(sb, r)
 
 func _draw_save_badge() -> void:
@@ -1546,6 +1894,10 @@ func _parse_capture_args() -> void:
 			capture_frames = int(a.substr(9))
 		elif a.begins_with("--scene="):
 			capture_scene = a.substr(8)
+		elif a.begins_with("--hp="):
+			capture_hp = float(a.substr(5))
+		elif a == "--mobile":
+			force_mobile = true
 		elif a.begins_with("--resize="):
 			var rs := a.substr(9).split("x")
 			if rs.size() == 2:
